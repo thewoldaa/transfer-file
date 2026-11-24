@@ -1,0 +1,16 @@
+# build / hasil
+dist/
+build/
+node_modules/
+
+# Android
+android/.gradle/
+android/app/build/
+android/local.properties
+android/.idea/
+*.keystore
+*.jks
+
+# config lokal PC
+config.json
+.planning/
