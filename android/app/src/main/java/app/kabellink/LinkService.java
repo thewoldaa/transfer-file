@@ -12,6 +12,7 @@ import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.Environment;
 import android.os.IBinder;
+import android.os.StatFs;
 import android.provider.Settings;
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -155,13 +156,20 @@ public class LinkService extends Service {
             String[] rl = line.split(" ");
             String method = rl.length > 0 ? rl[0] : "GET";
             String target = rl.length > 1 ? rl[1] : "/";
-            long len = 0;
+            long len = 0, rangeStart = -1;
             String tok = "", h;
             while ((h = readLine(in)) != null && !h.isEmpty()) {
                 String l = h.toLowerCase();
                 if (l.startsWith("content-length:")) {
                     try { len = Long.parseLong(h.substring(15).trim()); } catch (NumberFormatException ignored) { }
                 } else if (l.startsWith("x-token:")) tok = h.substring(8).trim();
+                else if (l.startsWith("range:")) {
+                    String v = h.substring(6).trim();
+                    if (v.startsWith("bytes=")) {
+                        try { rangeStart = Long.parseLong(v.substring(6).split("-")[0].trim()); }
+                        catch (NumberFormatException ignored) { }
+                    }
+                }
             }
 
             int q = target.indexOf('?');
@@ -189,11 +197,16 @@ public class LinkService extends Service {
                 case "/files":
                     send(sock, 200, list(param(query, "dir")));
                     break;
+                case "/hash":
+                    send(sock, 200, hash(param(query, "path")));
+                    break;
                 case "/file":
                     if (method.equals("GET") || method.equals("HEAD")) {
-                        download(sock, param(query, "path"), method.equals("HEAD"));
+                        download(sock, param(query, "path"), method.equals("HEAD"), rangeStart);
                     } else if (method.equals("PUT") || method.equals("POST")) {
                         send(sock, 200, upload(in, len, param(query, "path")));
+                    } else if (method.equals("DELETE")) {
+                        send(sock, 200, removeFile(param(query, "path")));
                     } else {
                         send(sock, 405, new JSONObject().put("error", "method tidak didukung"));
                     }
@@ -257,6 +270,7 @@ public class LinkService extends Service {
     private JSONObject list(String dir) throws Exception {
         File base = baseDir(this).getCanonicalFile();
         JSONObject o = new JSONObject().put("base", base.getPath()).put("all_files", allFiles());
+        try { o.put("free", new StatFs(base.getPath()).getAvailableBytes()); } catch (Exception ignored) { }
         File d = resolve(dir);
         if (d == null) return o.put("error", "path tidak valid");
         if (!d.exists()) return o.put("path", relPath(base, d)).put("error", "tidak ada");
@@ -275,22 +289,68 @@ public class LinkService extends Service {
         return o.put("path", relPath(base, d)).put("entries", a);
     }
 
-    private void download(Socket sock, String rel, boolean headOnly) throws Exception {
+    /** Unduh file; mendukung Range (lanjut unduhan yang terputus). */
+    private void download(Socket sock, String rel, boolean headOnly, long rangeStart) throws Exception {
         File f = resolve(rel);
         if (f == null) { send(sock, 403, new JSONObject().put("error", "path tidak valid")); return; }
         if (!f.isFile()) { send(sock, 404, new JSONObject().put("error", "bukan file")); return; }
         long size = f.length();
+        if (rangeStart > size) {
+            send(sock, 416, new JSONObject().put("error", "range di luar ukuran file").put("size", size));
+            return;
+        }
+        boolean part = rangeStart > 0 && rangeStart < size;
+        long start = part ? rangeStart : 0;
+        long send = size - start;
+        String head = part
+                ? "HTTP/1.1 206 X\r\nContent-Type: application/octet-stream\r\nContent-Length: " + send
+                  + "\r\nContent-Range: bytes " + start + "-" + (size - 1) + "/" + size
+                  + "\r\nConnection: close\r\n\r\n"
+                : "HTTP/1.1 200 X\r\nContent-Type: application/octet-stream\r\nContent-Length: " + size
+                  + "\r\nConnection: close\r\n\r\n";
         OutputStream os = new BufferedOutputStream(sock.getOutputStream(), 65536);
-        os.write(("HTTP/1.1 200 X\r\nContent-Type: application/octet-stream\r\nContent-Length: " + size
-                + "\r\nConnection: close\r\n\r\n").getBytes(UTF_8));
+        os.write(head.getBytes(UTF_8));
         if (!headOnly) {
             try (FileInputStream fi = new FileInputStream(f)) {
+                long skip = start;
+                while (skip > 0) {
+                    long s = fi.skip(skip);
+                    if (s <= 0) break;
+                    skip -= s;
+                }
                 byte[] b = new byte[65536];
                 int n;
                 while ((n = fi.read(b)) > 0) os.write(b, 0, n);
             }
         }
         os.flush();
+    }
+
+    /** SHA-256 isi file, dihitung di HP. */
+    private JSONObject hash(String rel) throws Exception {
+        File f = resolve(rel);
+        if (f == null) return new JSONObject().put("error", "path tidak valid");
+        if (!f.isFile()) return new JSONObject().put("error", "bukan file");
+        MessageDigest md = MessageDigest.getInstance("SHA-256");
+        try (FileInputStream fi = new FileInputStream(f)) {
+            byte[] b = new byte[65536];
+            int n;
+            while ((n = fi.read(b)) > 0) md.update(b, 0, n);
+        }
+        StringBuilder sb = new StringBuilder();
+        for (byte x : md.digest()) sb.append(String.format("%02x", x));
+        return new JSONObject().put("sha256", sb.toString()).put("size", f.length());
+    }
+
+    /** Hapus file (dipakai mode cut-off setelah transfer + checksum cocok). */
+    private JSONObject removeFile(String rel) throws Exception {
+        File f = resolve(rel);
+        if (f == null) return new JSONObject().put("error", "path tidak valid");
+        if (f.isDirectory()) return new JSONObject().put("error", "target adalah folder");
+        if (!f.isFile()) return new JSONObject().put("error", "tidak ada");
+        long size = f.length();
+        if (!f.delete()) return new JSONObject().put("error", "gagal menghapus");
+        return new JSONObject().put("ok", true).put("path", rel).put("size", size);
     }
 
     private JSONObject upload(InputStream in, long len, String rel) throws Exception {

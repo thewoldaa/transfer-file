@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 
 const TOKEN = 'TESTTOKN';
 const BASE = path.join(os.tmpdir(), 'transfer-file-mock');
@@ -19,7 +20,11 @@ const resolve = rel => {
   return f === BASE || f.startsWith(BASE + path.sep) ? f : null;
 };
 const relOf = f => path.relative(BASE, f).replace(/\\/g, '/');
-const enc = s => JSON.stringify(s);
+const sha256 = async f => {
+  const h = createHash('sha256');
+  await new Promise((ok, bad) => fs.createReadStream(f).on('data', d => h.update(d)).on('end', ok).on('error', bad));
+  return h.digest('hex');
+};
 
 http.createServer(async (q, r) => {
   const url = new URL(q.url, 'http://x');
@@ -38,25 +43,42 @@ http.createServer(async (q, r) => {
   }
   if (url.pathname === '/files') {
     const d = resolve(url.searchParams.get('dir'));
-    if (!d) return send(200, { base: BASE, all_files: true, error: 'path tidak valid' });
-    if (!fs.existsSync(d)) return send(200, { base: BASE, all_files: true, path: relOf(d), error: 'tidak ada' });
-    if (!fs.statSync(d).isDirectory()) return send(200, { base: BASE, all_files: true, path: relOf(d), error: 'bukan folder' });
+    const free = fs.statfsSync(BASE).bavail * fs.statfsSync(BASE).bsize;
+    if (!d) return send(200, { base: BASE, all_files: true, free, error: 'path tidak valid' });
+    if (!fs.existsSync(d)) return send(200, { base: BASE, all_files: true, free, path: relOf(d), error: 'tidak ada' });
+    if (!fs.statSync(d).isDirectory()) return send(200, { base: BASE, all_files: true, free, path: relOf(d), error: 'bukan folder' });
     const entries = fs.readdirSync(d, { withFileTypes: true })
       .map(e => {
         const f = path.join(d, e.name);
         return { name: e.name, dir: e.isDirectory(), size: e.isDirectory() ? 0 : fs.statSync(f).size, path: relOf(f) };
       })
       .sort((a, b) => (a.dir === b.dir ? a.name.localeCompare(b.name) : a.dir ? -1 : 1));
-    return send(200, { base: BASE, all_files: true, path: relOf(d), entries });
+    return send(200, { base: BASE, all_files: true, free, path: relOf(d), entries });
+  }
+  if (url.pathname === '/hash') {
+    const f = resolve(url.searchParams.get('path'));
+    if (!f) return send(403, { error: 'path tidak valid' });
+    if (!fs.existsSync(f) || !fs.statSync(f).isFile()) return send(404, { error: 'bukan file' });
+    return send(200, { sha256: await sha256(f), size: fs.statSync(f).size });
   }
   if (url.pathname === '/file') {
     const f = resolve(url.searchParams.get('path'));
     if (!f) return send(403, { error: 'path tidak valid' });
     if (q.method === 'GET' || q.method === 'HEAD') {
       if (!fs.existsSync(f) || !fs.statSync(f).isFile()) return send(404, { error: 'bukan file' });
-      r.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': fs.statSync(f).size });
+      const size = fs.statSync(f).size;
+      let start = 0;
+      const range = /^bytes=(\d+)-/.exec(String(q.headers.range || ''));
+      if (range) start = Number(range[1]);
+      if (start > size) return send(416, { error: 'range di luar ukuran file', size });
+      const part = start > 0 && start < size;
+      r.writeHead(part ? 206 : 200, {
+        'Content-Type': 'application/octet-stream',
+        'Content-Length': size - start,
+        ...(part ? { 'Content-Range': `bytes ${start}-${size - 1}/${size}` } : {}),
+      });
       if (q.method === 'HEAD') return r.end();
-      return fs.createReadStream(f).pipe(r);
+      return fs.createReadStream(f, { start }).pipe(r);
     }
     if (q.method === 'PUT' || q.method === 'POST') {
       const len = Number(q.headers['content-length'] || 0);
@@ -69,6 +91,16 @@ http.createServer(async (q, r) => {
       await new Promise(res => ws.on('close', res));
       if (got !== len) return send(400, { error: `transfer terputus (${got}/${len})` });
       return send(200, { ok: true, path: relOf(f), size: got });
+    }
+    if (q.method === 'DELETE') {
+      if (!fs.existsSync(f)) return send(404, { error: 'tidak ada' });
+      if (f === BASE) return send(403, { error: 'tidak boleh hapus akar' });
+      const size = fs.statSync(f).isDirectory() ? 0 : fs.statSync(f).size;
+      try {
+        if (fs.statSync(f).isDirectory()) fs.rmdirSync(f);
+        else fs.unlinkSync(f);
+      } catch (e) { return send(400, { error: 'gagal menghapus (folder tidak kosong?)' }); }
+      return send(200, { ok: true, path: relOf(f), size });
     }
     return send(405, { error: 'method tidak didukung' });
   }

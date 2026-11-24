@@ -4,7 +4,7 @@ Hubungkan HP Android (target: Samsung Galaxy A12) ke PC lewat **Wi-Fi atau kabel
 lalu **kirim/ambil file dua arah**: foto, video, dokumen, folder, apa saja.
 
 ```
-pc/        -> program PC (Node >= 24, tanpa dependensi) + pembangun EXE
+pc/        -> program PC (Node >= 24, tanpa dependensi) + pembangun EXE + Web UI lokal
 android/   -> APK pendamping (Java, jalan sebagai user biasa, tanpa root)
 .github/   -> workflow GitHub Actions: build APK + EXE, dan rilis otomatis
 ```
@@ -20,16 +20,48 @@ APK dan EXE hasil build bisa diunduh di tab **Releases** repo ini.
    - biarkan servisnya jalan (ada notifikasi "KabelLink aktif").
 3. Jalankan `transfer-file.exe` di PC (klik dua kali juga boleh).
 4. Masukkan token saat diminta (sekali saja, disimpan di `%USERPROFILE%\.transfer-file\config.json`).
+5. Ketik **`ui`** untuk membuka **Web UI** di browser.
 
 Setelah itu PC menemukan HP otomatis (IP tersimpan → broadcast UDP → scan subnet /24).
 Kalau kabel USB tercolok dan USB debugging aktif, kabel otomatis dipakai dan Wi-Fi jadi cadangan.
 
+## Web UI (paling mudah)
+
+Ketik `ui` di terminal, atau jalankan `transfer-file.exe --ui`, maka browser terbuka di
+`http://127.0.0.1:8767`. Isinya:
+
+- **Isi HP** — telusuri folder, lihat ukuran, tombol **Unduh** / **Unduh folder** / **Hapus**.
+- **Kirim ke HP** — taruh file di kotak (drag & drop) atau klik untuk pilih banyak file sekaligus.
+- **Antrean** — progress tiap transfer, status selesai/gagal, penanda `sha256 ok` dan `dihapus di HP`.
+- **Cut-off** dan **Verifikasi SHA-256** — sakelar, tersimpan di config.
+- **Sisa ruang HP** tampil di header.
+
+Semua file unduhan masuk ke `Downloads\transfer-file\` (bisa dibuka lewat tombol
+**Buka folder PC**). Server UI hanya mendengarkan di `127.0.0.1` dan mewajibkan header
+khusus, jadi situs lain tidak bisa memerintahkannya.
+
+## Mode Cut-off (potong-pindah)
+
+Aktifkan dengan `cutoff on` atau sakelar **Cut-off** di Web UI. Saat aktif, setiap file
+yang **berhasil diunduh** akan **dihapus dari HP** — tapi hanya setelah:
+
+1. jumlah byte yang diterima sama dengan ukuran asli, **dan**
+2. **SHA-256** file di HP sama dengan file di PC.
+
+Kalau salah satu gagal, file **tidak dihapus** dan diberi tanda gagal. Untuk folder,
+folder kosong di HP ikut dirapikan setelah semua isinya pindah. Cut-off hanya berlaku
+untuk arah HP → PC; file yang kamu kirim ke HP tidak dihapus dari PC.
+
 ## Perintah transfer
 
 ```
-ls [folder]                daftar isi HP
+ui                         buka Web UI di browser
+ls [folder]                daftar isi HP (+ sisa ruang)
 get <jarak> [lokal]        ambil file ATAU folder dari HP
 put <lokal> [folder jarak] kirim file ATAU folder ke HP
+rm <jarak>                 hapus file di HP
+cutoff [on|off]            mode potong: hapus di HP setelah unduhan lolos SHA-256
+verify [on|off]            cek SHA-256 setiap unduhan (default: on)
 ```
 
 Contoh:
@@ -44,7 +76,8 @@ kabellink> put "D:\album" Download
 ```
 
 Nama dengan spasi pakai tanda kutip. Transfer folder berjalan rekursif dan menampilkan progress.
-File yang sedang diunduh memakai akhiran `.part` sampai selesai, jadi tidak ada file setengah jadi.
+Unduhan memakai akhiran `.part` dan **bisa dilanjutkan** (HTTP Range) kalau Wi-Fi terputus —
+jalankan perintah yang sama lagi dan ia melanjutkan dari byte terakhir.
 
 Perintah lain: `status`, `info`, `sh <perintah>`, `adb-on`, `adb <args>`, `wifi`, `token <kode>`, `exit`.
 
@@ -65,6 +98,8 @@ Perintah lain: `status`, `info`, `sh <perintah>`, `adb-on`, `adb <args>`, `wifi`
 PC memantau kabel tiap 3 detik dengan perbaikan otomatis:
 `unauthorized` → minta tap Izinkan · `offline` → restart adb · `no permissions` (Linux) → aturan udev Samsung · HP terlihat tapi adb tidak → saran driver · tidak terlihat sama sekali → kabel hanya-cas.
 
+Tanpa adb sama sekali pun tetap bisa: **mode Wi-Fi** tidak memerlukan adb maupun USB debugging.
+
 ## Bangun sendiri lewat GitHub
 
 Push repo → tab **Actions** → workflow **build**:
@@ -75,8 +110,8 @@ Push repo → tab **Actions** → workflow **build**:
 Buat tag untuk merilis keduanya sekaligus:
 
 ```
-git tag v1.1.0
-git push origin v1.1.0
+git tag v1.2.0
+git push origin v1.2.0
 ```
 
 Job **release** mengunggah `transfer-file.apk`, `transfer-file.exe`, dan `SHA256SUMS.txt` ke Releases.
