@@ -80,7 +80,9 @@ public class MainActivity extends Activity {
         boolean all = LinkService.allFiles();
         status.setText("Folder transfer: " + LinkService.baseDir(this).getAbsolutePath()
                 + (all ? "\nAkses semua file: AKTIF (DCIM, Download, dll bisa ditransfer)"
-                       : "\nAkses semua file: BELUM — transfer hanya di folder aplikasi"));
+                       : "\nAkses semua file: BELUM — transfer hanya di folder aplikasi")
+                + "\n\nSelama servis aktif, Wi-Fi dan CPU ditahan tetap hidup"
+                + "\nagar transfer besar tetap jalan walau layar mati.");
     }
 
     private void askAllFiles() {

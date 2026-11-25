@@ -61,6 +61,25 @@ http.createServer(async (q, r) => {
     if (!fs.existsSync(f) || !fs.statSync(f).isFile()) return send(404, { error: 'bukan file' });
     return send(200, { sha256: await sha256(f), size: fs.statSync(f).size });
   }
+  if (url.pathname === '/stat') {
+    const rel = url.searchParams.get('path');
+    const f = resolve(rel);
+    if (!f) return send(403, { error: 'path tidak valid' });
+    if (fs.existsSync(f) && fs.statSync(f).isDirectory()) return send(200, { path: relOf(f), exists: true, dir: true, size: 0 });
+    if (!fs.existsSync(f)) return send(200, { path: rel || '', exists: false, dir: false, size: 0 });
+    return send(200, { path: relOf(f), exists: true, dir: false, size: fs.statSync(f).size, modified: fs.statSync(f).mtimeMs });
+  }
+  if (url.pathname === '/rename') {
+    const a = resolve(url.searchParams.get('from'));
+    const b = resolve(url.searchParams.get('to'));
+    if (!a || !b) return send(403, { error: 'path tidak valid' });
+    if (!fs.existsSync(a) || !fs.statSync(a).isFile()) return send(200, { error: 'tidak ada' });
+    if (fs.existsSync(b) && fs.statSync(b).isDirectory()) return send(200, { error: 'target adalah folder' });
+    await fsp.mkdir(path.dirname(b), { recursive: true });
+    if (fs.existsSync(b)) fs.unlinkSync(b);
+    fs.renameSync(a, b);
+    return send(200, { ok: true, path: relOf(b), size: fs.statSync(b).size });
+  }
   if (url.pathname === '/file') {
     const f = resolve(url.searchParams.get('path'));
     if (!f) return send(403, { error: 'path tidak valid' });
@@ -83,14 +102,21 @@ http.createServer(async (q, r) => {
     if (q.method === 'PUT' || q.method === 'POST') {
       const len = Number(q.headers['content-length'] || 0);
       if (!len) return send(400, { error: 'isi file kosong (butuh Content-Length)' });
+      const offset = Number(url.searchParams.get('offset') || 0);
+      const have = fs.existsSync(f) && fs.statSync(f).isFile() ? fs.statSync(f).size : 0;
+      if (offset > 0) {
+        if (have !== offset) return send(200, { error: 'offset tidak cocok', size: have, offset });
+      } else if (have > 0) {
+        fs.unlinkSync(f);
+      }
       await fsp.mkdir(path.dirname(f), { recursive: true });
-      const ws = fs.createWriteStream(f);
+      const ws = fs.createWriteStream(f, { flags: offset > 0 ? 'a' : 'w' });
       let got = 0;
       for await (const chunk of q) { got += chunk.length; if (!ws.write(chunk)) await new Promise(res => ws.once('drain', res)); }
       ws.end();
       await new Promise(res => ws.on('close', res));
-      if (got !== len) return send(400, { error: `transfer terputus (${got}/${len})` });
-      return send(200, { ok: true, path: relOf(f), size: got });
+      if (got !== len) return send(200, { error: `transfer terputus (${got}/${len} byte)`, size: fs.statSync(f).size, partial: true });
+      return send(200, { ok: true, path: relOf(f), size: fs.statSync(f).size });
     }
     if (q.method === 'DELETE') {
       if (!fs.existsSync(f)) return send(404, { error: 'tidak ada' });

@@ -12,6 +12,7 @@ import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.Environment;
 import android.os.IBinder;
+import android.os.PowerManager;
 import android.os.StatFs;
 import android.provider.Settings;
 import org.json.JSONArray;
@@ -50,6 +51,8 @@ public class LinkService extends Service {
     private ServerSocket http;
     private DatagramSocket udp;
     private WifiManager.MulticastLock lock;
+    private WifiManager.WifiLock wifiLock;
+    private PowerManager.WakeLock cpuLock;
 
     static String token(Context c) {
         SharedPreferences p = c.getSharedPreferences("kl", MODE_PRIVATE);
@@ -89,20 +92,45 @@ public class LinkService extends Service {
         startForeground(1, n);
         if (!running) {
             running = true;
-            WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
-            lock = wm.createMulticastLock("kl");
-            lock.acquire();
+            acquireLocks();
             pool.execute(this::httpLoop);
             pool.execute(this::udpLoop);
         }
         return START_STICKY;
     }
 
+    /**
+     * Tahan agar transfer malam hari tidak terputus: CPU tetap bangun (layar boleh
+     * mati) dan Wi-Fi tidak dimatikan sistem saat perangkat "tidur".
+     * WIFI_MODE_FULL memang deprecated di API baru, tapi masih pilihan paling hemat
+     * dibanding HIGH_PERF dan tetap didukung semua versi Android yang disasar.
+     */
+    @SuppressWarnings("deprecation")
+    private void acquireLocks() {
+        WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+        lock = wm.createMulticastLock("kl");
+        lock.setReferenceCounted(false);
+        lock.acquire();
+        wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL, "kl-wifi");
+        wifiLock.setReferenceCounted(false);
+        wifiLock.acquire();
+        PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+        cpuLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "kabellink:cpu");
+        cpuLock.setReferenceCounted(false);
+        cpuLock.acquire();
+    }
+
+    private void releaseLocks() {
+        if (lock != null && lock.isHeld()) lock.release();
+        if (wifiLock != null && wifiLock.isHeld()) wifiLock.release();
+        if (cpuLock != null && cpuLock.isHeld()) cpuLock.release();
+    }
+
     @Override public void onDestroy() {
         running = false;
         try { if (http != null) http.close(); } catch (IOException ignored) { }
         if (udp != null) udp.close();
-        if (lock != null && lock.isHeld()) lock.release();
+        releaseLocks();
         pool.shutdownNow();
         super.onDestroy();
     }
@@ -200,11 +228,19 @@ public class LinkService extends Service {
                 case "/hash":
                     send(sock, 200, hash(param(query, "path")));
                     break;
+                case "/stat":
+                    send(sock, 200, stat(param(query, "path")));
+                    break;
+                case "/rename":
+                    send(sock, 200, rename(param(query, "from"), param(query, "to")));
+                    break;
                 case "/file":
                     if (method.equals("GET") || method.equals("HEAD")) {
                         download(sock, param(query, "path"), method.equals("HEAD"), rangeStart);
                     } else if (method.equals("PUT") || method.equals("POST")) {
-                        send(sock, 200, upload(in, len, param(query, "path")));
+                        long offset = -1;
+                        try { offset = Long.parseLong(param(query, "offset")); } catch (NumberFormatException ignored) { }
+                        send(sock, 200, upload(in, len, param(query, "path"), offset));
                     } else if (method.equals("DELETE")) {
                         send(sock, 200, removeFile(param(query, "path")));
                     } else {
@@ -353,16 +389,55 @@ public class LinkService extends Service {
         return new JSONObject().put("ok", true).put("path", rel).put("size", size);
     }
 
-    private JSONObject upload(InputStream in, long len, String rel) throws Exception {
+    /** Info satu file (ukuran, ada/tidak) — dipakai untuk melanjutkan unggahan. */
+    private JSONObject stat(String rel) throws Exception {
+        JSONObject o = new JSONObject();
+        File f = resolve(rel);
+        if (f == null) return o.put("error", "path tidak valid");
+        o.put("path", rel);
+        if (f.isDirectory()) return o.put("exists", true).put("dir", true).put("size", 0);
+        if (!f.isFile()) return o.put("exists", false).put("dir", false).put("size", 0);
+        return o.put("exists", true).put("dir", false).put("size", f.length()).put("modified", f.lastModified());
+    }
+
+    /** Ganti nama / pindah file (unggahan yang dilanjutkan: .part -> nama akhir). */
+    private JSONObject rename(String from, String to) throws Exception {
+        File a = resolve(from), b = resolve(to);
+        if (a == null || b == null) return new JSONObject().put("error", "path tidak valid");
+        if (!a.isFile()) return new JSONObject().put("error", "tidak ada");
+        if (b.isDirectory()) return new JSONObject().put("error", "target adalah folder");
+        File parent = b.getParentFile();
+        if (parent != null && !parent.isDirectory() && !parent.mkdirs())
+            return new JSONObject().put("error", "gagal membuat folder");
+        if (b.exists() && !b.delete()) return new JSONObject().put("error", "gagal menimpa file lama");
+        if (!a.renameTo(b)) return new JSONObject().put("error", "gagal mengganti nama");
+        return new JSONObject().put("ok", true).put("path", to).put("size", b.length());
+    }
+
+    /**
+     * Terima file. Kalau offset > 0, isi ditambahkan ke akhir file yang sudah ada
+     * (lanjut unggahan yang terputus); ukuran saat ini harus sama dengan offset.
+     */
+    private JSONObject upload(InputStream in, long len, String rel, long offset) throws Exception {
         JSONObject o = new JSONObject();
         File f = resolve(rel);
         if (f == null) return o.put("error", "path tidak valid");
         if (f.isDirectory()) return o.put("error", "target adalah folder");
         if (len <= 0) return o.put("error", "isi file kosong (butuh Content-Length)");
+        long have = f.isFile() ? f.length() : 0;
+        if (offset > 0) {
+            if (have != offset) {
+                return o.put("error", "offset tidak cocok").put("size", have).put("offset", offset);
+            }
+        } else if (have > 0) {
+            // mulai dari nol: buang sisa data lama
+            if (!f.delete()) return o.put("error", "gagal menimpa file lama");
+            have = 0;
+        }
         File parent = f.getParentFile();
         if (parent != null && !parent.isDirectory() && !parent.mkdirs()) return o.put("error", "gagal membuat folder");
         long left = len;
-        try (FileOutputStream fo = new FileOutputStream(f)) {
+        try (FileOutputStream fo = new FileOutputStream(f, have > 0)) {
             byte[] b = new byte[65536];
             int n;
             while (left > 0 && (n = in.read(b, 0, (int) Math.min(b.length, left))) > 0) {
@@ -370,11 +445,12 @@ public class LinkService extends Service {
                 left -= n;
             }
         }
+        // Jangan hapus saat terputus: sisa byte disimpan supaya bisa dilanjutkan nanti.
         if (left > 0) {
-            f.delete();
-            return o.put("error", "transfer terputus (" + (len - left) + "/" + len + " byte)");
+            return o.put("error", "transfer terputus (" + (len - left) + "/" + len + " byte)")
+                    .put("size", f.length()).put("partial", true);
         }
-        return o.put("ok", true).put("path", rel).put("size", f.length());
+        return o.put("ok", true).put("path", rel).put("size", f.length()).put("offset", offset > 0 ? offset : 0);
     }
 
     // ---------- kontrol ----------

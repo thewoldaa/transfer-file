@@ -13,7 +13,11 @@ const jobs = new Map();
 let seq = 0;
 function newJob(kind, name, mode) {
   const id = ++seq;
-  const j = { id, kind, name, mode, total: 0, done: 0, status: 'jalan', error: null, dest: '', deleted: false, verified: false, at: Date.now() };
+  const j = {
+    id, kind, name, mode, total: 0, done: 0, status: 'jalan', error: null, dest: '',
+    deleted: false, verified: false, at: Date.now(),
+    remote: null, tmp: null, resumable: false,
+  };
   jobs.set(id, j);
   for (const [k, v] of jobs) if (jobs.size > 120 && v.status !== 'jalan') jobs.delete(k);
   return j;
@@ -84,6 +88,14 @@ function openBrowser(u) {
   exec(cmd, { shell: true }, () => {});
 }
 
+/** Jalankan unduhan (file atau folder) sebagai job; gagal => bisa dilanjutkan. */
+function runPull(j) {
+  (async () => {
+    try { await pullPath(j.remote, j); j.status = 'selesai'; }
+    catch (e) { j.status = 'gagal'; j.error = e.message; j.resumable = true; }
+  })();
+}
+
 function openFolder(dir) {
   const cmd = process.platform === 'win32' ? `explorer "${dir}"`
     : process.platform === 'darwin' ? `open "${dir}"` : `xdg-open "${dir}"`;
@@ -141,11 +153,36 @@ async function route(req, res) {
       const { path: remote } = await readJson(req);
       if (!remote) return json(res, 400, { error: 'path kosong' });
       const j = newJob('unduh', path.posix.basename(remote), 'file');
-      (async () => {
-        try { await pullPath(remote, j); j.status = 'selesai'; }
-        catch (e) { j.status = 'gagal'; j.error = e.message; }
-      })();
+      j.remote = remote;
+      runPull(j);
       return json(res, 200, j);
+    }
+
+    if (p === '/api/resume' && req.method === 'POST') {
+      const { id } = await readJson(req);
+      const j = jobs.get(Number(id));
+      if (!j) return json(res, 404, { error: 'transfer tidak ada' });
+      if (j.status === 'jalan') return json(res, 400, { error: 'masih berjalan' });
+      if (j.kind === 'unduh' && j.remote) {
+        Object.assign(j, { status: 'jalan', error: null, done: 0, resumable: false });
+        runPull(j);
+        return json(res, 200, j);
+      }
+      if (j.kind === 'kirim' && j.tmp) {
+        const tmp = j.tmp;
+        if (!(await fsp.stat(tmp).catch(() => null))) return json(res, 400, { error: 'salinan sementara sudah hilang' });
+        Object.assign(j, { status: 'jalan', error: null, done: 0, resumable: false });
+        (async () => {
+          try {
+            await apiRef.upload(tmp, j.remote, { onProgress: d => { j.done = d; } });
+            j.status = 'selesai';
+            await fsp.rm(tmp, { force: true });
+            j.tmp = null;
+          } catch (e) { j.status = 'gagal'; j.error = e.message; j.resumable = true; }
+        })();
+        return json(res, 200, j);
+      }
+      return json(res, 400, { error: 'transfer ini tidak bisa dilanjutkan' });
     }
 
     if (p === '/api/ul' && req.method === 'POST') {
@@ -162,12 +199,15 @@ async function route(req, res) {
       if (len && got !== len) { await fsp.rm(tmp, { force: true }); return json(res, 400, { error: `upload terputus (${got}/${len})` }); }
       const j = newJob('kirim', name, 'file');
       j.total = (await fsp.stat(tmp)).size;
+      j.remote = apiRef.join(dir, name);
+      j.tmp = tmp;
       (async () => {
         try {
-          await apiRef.upload(tmp, apiRef.join(dir, name), { onProgress: (d) => { j.done = d; } });
+          await apiRef.upload(tmp, j.remote, { onProgress: (d) => { j.done = d; } });
           j.status = 'selesai';
-        } catch (e) { j.status = 'gagal'; j.error = e.message; }
-        finally { await fsp.rm(tmp, { force: true }); }
+          await fsp.rm(tmp, { force: true });
+          j.tmp = null;
+        } catch (e) { j.status = 'gagal'; j.error = e.message; j.resumable = true; }
       })();
       return json(res, 200, j);
     }
@@ -185,6 +225,12 @@ async function route(req, res) {
     if (p === '/api/verify' && req.method === 'POST') {
       const { on } = await readJson(req);
       await apiRef.setVerify(on);
+      return json(res, 200, apiRef.state);
+    }
+
+    if (p === '/api/limit' && req.method === 'POST') {
+      const { kbps } = await readJson(req);
+      await apiRef.setLimit(kbps);
       return json(res, 200, apiRef.state);
     }
 
@@ -222,9 +268,10 @@ function listen(srv, port) {
   });
 }
 
-export async function startUi(api) {
+export async function startUi(api, opts = {}) {
   apiRef = api;
-  if (server) { openBrowser(url); return url; }
+  const open = opts.open !== false;
+  if (server) { if (open) openBrowser(url); return url; }
   const srv = http.createServer((req, res) => { route(req, res); });
   let port = 8767;
   for (; port < 8780; port++) {
@@ -233,7 +280,7 @@ export async function startUi(api) {
   server = srv;
   url = `http://127.0.0.1:${port}`;
   console.log(`Web UI: ${url}  (tutup dengan Ctrl+C atau biarkan)`);
-  openBrowser(url);
+  if (open) openBrowser(url);
   return url;
 }
 
@@ -294,6 +341,8 @@ td.n{font-variant-numeric:tabular-nums;color:var(--dim);white-space:nowrap}
 .muted{color:var(--dim)}
 .warnbox{margin:14px;padding:10px 12px;border:1px solid #5a4620;background:#2a2113;color:var(--warn);border-radius:10px;font-size:12.5px}
 input[type=text]{width:100%;padding:8px 10px;border-radius:8px;border:1px solid var(--line);background:#12151b;color:var(--txt);font:inherit}
+select{width:100%;padding:8px 10px;border-radius:8px;border:1px solid var(--line);background:#12151b;color:var(--txt);font:inherit;margin-top:8px}
+select:focus{outline:1px solid var(--acc)}
 .hint{font-size:11.5px;color:var(--dim);margin-top:6px}
 .empty{padding:22px;text-align:center;color:var(--dim)}
 .toast{position:fixed;right:18px;top:70px;background:#20262f;border:1px solid var(--line);padding:10px 14px;border-radius:10px;opacity:0;transform:translateY(-8px);transition:.2s;max-width:380px;z-index:20}
@@ -347,6 +396,29 @@ input[type=text]{width:100%;padding:8px 10px;border-radius:8px;border:1px solid 
     </section>
 
     <section class="card">
+      <h2>Mode transmisi lambat</h2>
+      <div class="tags">
+        <div class="tag" style="display:block">
+          <b style="font-size:13px">Batas kecepatan</b>
+          <select id="limit">
+            <option value="0">Penuh (tanpa batas)</option>
+            <option value="128">128 KB/detik — paling dingin</option>
+            <option value="256">256 KB/detik</option>
+            <option value="512">512 KB/detik</option>
+            <option value="1024">1 MB/detik</option>
+            <option value="2048">2 MB/detik</option>
+            <option value="4096">4 MB/detik</option>
+          </select>
+          <div class="hint">Untuk transfer besar semalam: pilih lambat supaya HP dan PC tidak panas. Progress tetap jalan, dan kalau koneksi putus transfer bisa dilanjutkan.</div>
+        </div>
+        <div class="tag" style="display:block">
+          <div><b style="font-size:13px">Jalan di latar belakang</b>
+          <div class="hint">Transfer tetap berjalan walau jendela ini ditutup. Dari terminal: <b>bg</b> untuk mulai, <b>stop</b> untuk berhenti, <b>autostart on</b> supaya ikut menyala bersama Windows.</div></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="card">
       <h2>Antrean</h2>
       <div id="jobs"><div class="empty">belum ada transfer</div></div>
     </section>
@@ -371,6 +443,17 @@ function paintState(){
   $('#localDir').textContent=state.localDir;
   $('#tokenBox').style.display=(!state.tokenSet||showToken)?'block':'none';
   if(state.cutOff)$('#swVer').classList.add('on');
+  setLimitSelect(state.limitKBps||0);
+}
+
+function setLimitSelect(v){
+  var sel=$('#limit');
+  if(!sel||document.activeElement===sel)return;
+  v=String(v||0);
+  if(!Array.prototype.some.call(sel.options,function(o){return o.value===v})){
+    var o=document.createElement('option');o.value=v;o.textContent=v+' KB/detik';sel.appendChild(o);
+  }
+  sel.value=v;
 }
 
 function paintCrumb(){
@@ -443,6 +526,9 @@ function jobRow(j){
   bar.appendChild(fill);t.appendChild(bar);
   el.appendChild(t);
   if(j.status==='selesai'&&j.mode==='file'){var o=document.createElement('button');o.className='ghost';o.textContent='Buka';o.onclick=function(){post('/api/open')};el.appendChild(o)}
+  if(j.status==='gagal'&&j.resumable){var rb=document.createElement('button');rb.className='primary';
+    rb.textContent=j.kind==='unduh'?'Lanjutkan':'Kirim ulang';
+    rb.onclick=function(){post('/api/resume',{id:j.id}).then(function(){toast('melanjutkan…');loadJobs(true)}).catch(function(e){toast('gagal: '+e.message)})};el.appendChild(rb)}
   return el;
 }
 
@@ -474,6 +560,8 @@ function uploadFiles(files){
 
 $('#swCut').onclick=function(){post('/api/cutoff',{on:!state.cutOff}).then(function(s){state=s;paintState();toast('cut-off '+(s.cutOff?'AKTIF':'mati'))})};
 $('#swVer').onclick=function(){post('/api/verify',{on:!state.verify}).then(function(s){state=s;paintState()})};
+$('#limit').onchange=function(){var v=Number(this.value)||0;
+  post('/api/limit',{kbps:v}).then(function(s){state=s;paintState();toast(v>0?'transmisi dibatasi '+v+' KB/detik':'batas kecepatan dimatikan')}).catch(function(e){toast('gagal: '+e.message)})};
 $('#reconnect').onclick=function(){toast('mencari HP…');post('/api/reconnect').then(function(s){state=s;paintState();loadDir()})};
 $('#btnToken').onclick=function(){showToken=!showToken;paintState();if(showToken)$('#token').focus()};
 $('#openFolder').onclick=function(){post('/api/open').then(function(r){toast('folder: '+r.dir)})};

@@ -2,9 +2,9 @@
 // KabelLink (PC) — Node >= 24, tanpa dependensi. Jalankan sebagai root / Administrator.
 // Urutan: jaringan dulu (APK di HP) -> pantau kabel USB -> kalau kabel ada, pakai kabel.
 // Transfer file:  ls | get <jarak> [lokal] | put <lokal> [folder jarak] | ui
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
-import { createReadStream, createWriteStream } from 'node:fs';
+import { createReadStream, createWriteStream, openSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { Transform, Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
@@ -17,14 +17,82 @@ import readline from 'node:readline/promises';
 const run = promisify(execFile);
 const HOME = process.env.KABELLINK_HOME || path.join(os.homedir(), '.transfer-file');
 const CFG = path.join(HOME, 'config.json');
+const PIDF = path.join(HOME, 'daemon.pid');
+const LOGF = path.join(HOME, 'kabellink.log');
 const HTTP_PORT = 8765, UDP_PORT = 8766, FWD_PORT = 18765, SAMSUNG = '04e8', PKG = 'app.kabellink';
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const log = (...a) => console.log(new Date().toTimeString().slice(0, 8), ...a);
 
-let cfg = { token: '', ip: '', cutOff: false, verify: true, localDir: path.join(os.homedir(), 'Downloads', 'transfer-file') };
+/** Buka URL di browser bawaan tanpa memblokir. */
+function openUrl(u) {
+  try {
+    const bin = process.platform === 'win32' ? 'cmd' : process.platform === 'darwin' ? 'open' : 'xdg-open';
+    const args = process.platform === 'win32' ? ['/c', 'start', '', u] : [u];
+    spawn(bin, args, { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+  } catch {}
+}
+
+let cfg = { token: '', ip: '', cutOff: false, verify: true, limitKBps: 0, localDir: path.join(os.homedir(), 'Downloads', 'transfer-file') };
 const save = () => fs.mkdir(HOME, { recursive: true })
   .then(() => fs.writeFile(CFG, JSON.stringify(cfg, null, 2), { mode: 0o600 }))
   .catch(e => log('gagal simpan config:', e.message));
+
+// ---------- latar belakang (daemon) ----------
+const pidFile = () => fs.readFile(PIDF, 'utf8').then(t => parseInt(t.trim(), 10) || 0).catch(() => 0);
+
+async function readPid() {
+  const n = await pidFile();
+  if (!n) return 0;
+  try { process.kill(n, 0); return n; } catch { return 0; }
+}
+
+/** Path skrip ini kalau dijalankan lewat `node kabellink.mjs` (bukan EXE/SEA). */
+function scriptPath() {
+  const a = process.argv[1];
+  return a && /\.[cm]?js$/i.test(a) ? path.resolve(a) : null;
+}
+
+function spawnArgs(flag) {
+  const sp = scriptPath();
+  return sp ? [sp, flag] : [flag];
+}
+
+/** Jalankan salinan diri sendiri tanpa jendela konsol. Kembalikan PID. */
+async function startDaemon() {
+  const already = await readPid();
+  if (already) return { pid: already, already: true };
+  await fs.mkdir(HOME, { recursive: true });
+  const out = openSync(LOGF, 'a');
+  const child = spawn(process.execPath, spawnArgs('--daemon'), {
+    detached: true, stdio: ['ignore', out, out], windowsHide: true,
+  });
+  child.unref();
+  for (let i = 0; i < 50; i++) {
+    await sleep(100);
+    const p = await readPid();
+    if (p) return { pid: p, already: false };
+  }
+  return { pid: child.pid, already: false };
+}
+
+async function stopDaemon() {
+  const pid = await readPid();
+  if (pid) { try { process.kill(pid); } catch {} }
+  await fs.rm(PIDF, { force: true });
+  return pid;
+}
+
+async function autostart(on) {
+  const key = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
+  if (process.platform !== 'win32') throw new Error('autostart otomatis hanya untuk Windows');
+  if (on) {
+    const cmd = `"${process.execPath}"` + (scriptPath() ? ` "${scriptPath()}"` : '') + ' --daemon';
+    await run('reg', ['add', key, '/v', 'KabelLink', '/t', 'REG_SZ', '/d', cmd, '/f']);
+  } else {
+    await run('reg', ['delete', key, '/v', 'KabelLink', '/f']).catch(() => {});
+  }
+  return on;
+}
 
 // ---------- hak akses ----------
 async function isElevated() {
@@ -253,15 +321,28 @@ const drawProgress = (label, sent, total) => {
   draw(`${label}  ${pct}%  ${fmt(sent)}${total ? '/' + fmt(total) : ''}`);
 };
 
-function meter(total, label, onTick) {
-  let sent = 0, last = 0;
+/**
+ * Penghitung progres + pembatas kecepatan (mode transmisi lambat).
+ * Kalau cfg.limitKBps > 0, data "diperlambat" dengan menunda tiap potongan
+ * supaya rata-rata byte/detik tidak melebihi batas — HP & PC tetap dingin.
+ */
+function meter(total, label, onTick, initial = 0) {
+  let sent = initial, last = 0;
   const tickFn = onTick || ((d, t) => drawProgress(label, d, t));
+  const kbps = Number(cfg.limitKBps || 0);
+  const bps = kbps > 0 ? kbps * 1024 : 0;
+  const t0 = Date.now();
+  let moved = 0;
   return new Transform({
     transform(chunk, _enc, cb) {
       sent += chunk.length;
       const now = Date.now();
       if (now - last > 150) { last = now; tickFn(sent, total); }
-      cb(null, chunk);
+      if (!bps) return cb(null, chunk);
+      moved += chunk.length;
+      const wait = t0 + (moved * 1000) / bps - now;
+      if (wait > 0) setTimeout(() => cb(null, chunk), wait);
+      else cb(null, chunk);
     },
     flush(cb) { tickFn(sent, total); if (!onTick && process.stdout.isTTY) done(); cb(); },
   });
@@ -284,6 +365,22 @@ async function deleteRemote(remote) {
 
 async function hashRemote(remote) {
   const r = await phoneFetch(`/hash?path=${enc(remote)}`, { headers: { 'X-Token': cfg.token } });
+  return r.json().catch(() => ({ error: `HTTP ${r.status}` }));
+}
+
+/** Ukuran file di HP (untuk melanjutkan unggahan). */
+async function statRemote(remote) {
+  const r = await phoneFetch(`/stat?path=${enc(remote)}`, {
+    headers: { 'X-Token': cfg.token }, signal: AbortSignal.timeout(20000),
+  });
+  return r.json().catch(() => ({ error: `HTTP ${r.status}` }));
+}
+
+/** Ganti nama / pindah file di HP (menyelesaikan unggahan .part). */
+async function renameRemote(from, to) {
+  const r = await phoneFetch(`/rename?from=${enc(from)}&to=${enc(to)}`, {
+    method: 'POST', headers: { 'X-Token': cfg.token }, signal: AbortSignal.timeout(20000),
+  });
   return r.json().catch(() => ({ error: `HTTP ${r.status}` }));
 }
 
@@ -324,11 +421,9 @@ async function downloadOne(remote, localFile, opt = {}) {
       const total = r.status === 206 ? have + clen : clen;
       if (r.status !== 206) have = 0;
       await fs.mkdir(path.dirname(localFile), { recursive: true });
-      let got = have;
-      const tick = onProgress || ((d, t) => drawProgress(label, d, t));
       await pipeline(
         Readable.fromWeb(r.body),
-        new Transform({ transform(c, _e, cb) { got += c.length; tick(got, total); cb(null, c); } }),
+        meter(total, label, onProgress, have),
         createWriteStream(part, { flags: have > 0 ? 'a' : 'w' }),
       );
       const size = (await fs.stat(part)).size;
@@ -336,7 +431,7 @@ async function downloadOne(remote, localFile, opt = {}) {
 
       const needCheck = verify || cutOff;
       if (needCheck) {
-        tick(size, size);
+        if (onProgress) onProgress(size, size); else drawProgress(label, size, size);
         const rh = await hashRemote(remote);
         if (!rh || rh.error) throw new Error(`cek SHA-256 di HP gagal: ${rh?.error || '?'}`);
         const lh = await localHash(part);
@@ -363,21 +458,45 @@ async function downloadOne(remote, localFile, opt = {}) {
   throw err;
 }
 
+/**
+ * Kirim satu file. Selalu menulis ke `<nama>.part` dulu dan melanjutkan dari
+ * byte terakhir kalau file .part sudah ada di HP (offset append), lalu
+ * mengganti namanya begitu selesai. Jadi koneksi putus kapan pun tidak
+ * menghapus kemajuan.
+ */
 async function uploadOne(localFile, remote, opt = {}) {
   const size = (await fs.stat(localFile)).size;
   const { onProgress, label = path.basename(localFile) } = opt;
+  const part = `${remote}.part`;
   let err = new Error('belum terhubung');
   for (const b of bases()) {
     try {
-      const r = await fetch(`${b}/file?path=${enc(remote)}`, {
+      let have = 0;
+      const s = await statRemote(part);
+      if (s && !s.error && s.exists) {
+        have = Number(s.size || 0);
+        if (have > size) { await deleteRemote(part).catch(() => {}); have = 0; }
+      }
+
+      if (have >= size) {
+        const mv = await renameRemote(part, remote);
+        if (!mv.ok) throw new Error(`gagal menyelesaikan: ${mv.error || '?'}`);
+        if (onProgress) onProgress(size, size);
+        return mv.size ?? size;
+      }
+
+      const r = await fetch(`${b}/file?path=${enc(part)}${have > 0 ? '&offset=' + have : ''}`, {
         method: 'PUT',
-        headers: { 'X-Token': cfg.token, 'Content-Length': String(size) },
-        body: createReadStream(localFile).pipe(meter(size, label, onProgress)),
+        headers: { 'X-Token': cfg.token, 'Content-Length': String(size - have) },
+        body: createReadStream(localFile, { start: have }).pipe(meter(size, label, onProgress, have)),
         duplex: 'half',
       });
       const j = await r.json().catch(() => ({ error: `HTTP ${r.status}` }));
       if (!r.ok || j.error) throw new Error(j.error || `HTTP ${r.status}`);
-      return j.size ?? size;
+
+      const mv = await renameRemote(part, remote);
+      if (!mv.ok) throw new Error(`gagal menyelesaikan: ${mv.error || '?'}`);
+      return mv.size ?? size;
     } catch (e) { err = e; }
   }
   throw err;
@@ -477,18 +596,26 @@ async function handover() {
   console.log((await adb('connect', `${ip}:5555`)).out);
 }
 
-const HELP = `perintah: ui | ls [folder] | get <jarak> [lokal] | put <lokal> [folder jarak] | rm <jarak>
+const HELP = `perintah: ui | bg | stop | open | autostart [on|off] | limit <KB/detik|off>
+          ls [folder] | get <jarak> [lokal] | put <lokal> [folder jarak] | rm <jarak>
           cutoff [on|off] | verify [on|off] | status | info | sh <perintah> | adb-on | adb <args> | wifi | token <kode> | exit
-  ui     -> buka Web UI di browser (paling mudah untuk salin file)
-  ls     -> daftar isi HP (folder relatif: Download, DCIM/Camera, ...)
-  get    -> ambil file ATAU folder dari HP (folder: DCIM/Camera .)
-  put    -> kirim file ATAU folder ke HP (default: folder akar)
-  rm     -> hapus file di HP
-  cutoff -> mode potong: file yang berhasil diunduh + lolos SHA-256 DIHAPUS dari HP
-  verify -> cek SHA-256 setiap unduhan (default: on)
-  sh     -> dijalankan di HP sebagai user biasa (bukan root)
-  adb    -> teruskan ke adb (otomatis -s <serial kabel>)
-  wifi   -> dari kabel, aktifkan adb-over-Wi-Fi (tcpip 5555) lalu connect`;
+  ui       -> buka Web UI di browser (paling mudah untuk salin file)
+  bg       -> jalankan di latar belakang (tanpa jendela konsol), Web UI tetap aktif
+  stop     -> hentikan proses latar belakang
+  open     -> buka Web UI dari proses latar belakang (otomatis menjalankan bg)
+  autostart-> jalankan otomatis saat Windows menyala (on|off)
+  limit    -> mode transmisi lambat, mis. limit 256 (KB/detik) atau limit off
+  ls       -> daftar isi HP (folder relatif: Download, DCIM/Camera, ...)
+  get      -> ambil file ATAU folder dari HP (folder: DCIM/Camera .)
+  put      -> kirim file ATAU folder ke HP (default: folder akar)
+  rm       -> hapus file di HP
+  cutoff   -> mode potong: file yang berhasil diunduh + lolos SHA-256 DIHAPUS dari HP
+  verify   -> cek SHA-256 setiap unduhan (default: on)
+  sh       -> dijalankan di HP sebagai user biasa (bukan root)
+  adb      -> teruskan ke adb (otomatis -s <serial kabel>)
+  wifi     -> dari kabel, aktifkan adb-over-Wi-Fi (tcpip 5555) lalu connect`;
+
+const yes = v => /^(on|1|ya|true|aktif)$/i.test(String(v || ''));
 
 async function exec(line, rl, closed) {
   const [cmd, ...rest] = splitArgs(line.trim());
@@ -499,21 +626,57 @@ async function exec(line, rl, closed) {
       const { startUi } = await import('./web.mjs');
       await startUi(api);
     }
+    else if (cmd === 'bg' || cmd === 'background' || cmd === 'start') {
+      const r = await startDaemon();
+      console.log(r.already ? `sudah jalan di latar belakang (PID ${r.pid})` : `jalan di latar belakang (PID ${r.pid})`);
+      console.log(`Web UI: http://127.0.0.1:8767   log: ${LOGF}`);
+      console.log('boleh tutup jendela ini — transfer tetap jalan. Hentikan dengan: stop');
+    }
+    else if (cmd === 'stop') {
+      const pid = await stopDaemon();
+      console.log(pid ? `dihentikan (PID ${pid})` : 'tidak ada proses latar belakang');
+    }
+    else if (cmd === 'open') {
+      const r = await startDaemon();
+      if (!r.already) console.log(`latar belakang dijalankan (PID ${r.pid})`);
+      await sleep(700);
+      openUrl('http://127.0.0.1:8767');
+      console.log('Web UI: http://127.0.0.1:8767');
+    }
+    else if (cmd === 'autostart') {
+      const on = rest[0] ? yes(rest[0]) : true;
+      await autostart(on);
+      console.log(on ? 'autostart AKTIF — KabelLink ikut jalan saat Windows menyala' : 'autostart dimatikan');
+    }
+    else if (cmd === 'limit') {
+      if (!rest[0]) {
+        console.log(cfg.limitKBps > 0 ? `transmisi dibatasi ${cfg.limitKBps} KB/detik` : 'transmisi penuh (tanpa batas)');
+        return;
+      }
+      cfg.limitKBps = yes(rest[0]) && !/^\d/.test(rest[0]) ? 0 : Math.max(0, Number(rest[0]) || 0);
+      await save();
+      console.log(cfg.limitKBps > 0
+        ? `mode transmisi lambat: maksimal ${cfg.limitKBps} KB/detik (${(cfg.limitKBps / 1024).toFixed(2)} MB/detik)`
+        : 'batas kecepatan dimatikan (transmisi penuh)');
+    }
     else if (cmd === 'ls') await ls(rest[0] ?? '');
     else if (cmd === 'get') { if (!rest[0]) return console.log('pakai: get <jarak> [lokal]'); await get(rest[0], rest[1]); }
     else if (cmd === 'put') { if (!rest[0]) return console.log('pakai: put <lokal> [folder jarak]'); await put(rest[0], rest[1]); }
     else if (cmd === 'rm') { if (!rest[0]) return console.log('pakai: rm <jarak>'); console.log(await deleteRemote(rest[0])); }
     else if (cmd === 'cutoff') {
-      cfg.cutOff = rest[0] ? /^(on|1|ya|true)$/i.test(rest[0]) : !cfg.cutOff;
+      cfg.cutOff = rest[0] ? yes(rest[0]) : !cfg.cutOff;
       await save();
       console.log(`mode cut-off: ${cfg.cutOff ? 'AKTIF — file yang berhasil diunduh dihapus dari HP (setelah SHA-256 cocok)' : 'mati'}`);
     }
     else if (cmd === 'verify') {
-      cfg.verify = rest[0] ? /^(on|1|ya|true)$/i.test(rest[0]) : !cfg.verify;
+      cfg.verify = rest[0] ? yes(rest[0]) : !cfg.verify;
       await save();
       console.log(`verifikasi SHA-256: ${cfg.verify ? 'AKTIF' : 'mati'}${cfg.cutOff ? ' (cut-off selalu verifikasi)' : ''}`);
     }
-    else if (cmd === 'status') console.log(JSON.stringify({ kabel: st.serial, wifi: st.net, cutOff: cfg.cutOff, verify: cfg.verify, folder: cfg.localDir }));
+    else if (cmd === 'status') console.log(JSON.stringify({
+      kabel: st.serial, wifi: st.net, cutOff: cfg.cutOff, verify: cfg.verify,
+      limitKBps: cfg.limitKBps || 0, folder: cfg.localDir, latar: (await readPid()) || null,
+    }));
     else if (cmd === 'info') await showBase();
     else if (cmd === 'sh') console.log((await call('/shell', arg)).out);
     else if (cmd === 'adb-on') console.log(await call('/adb-on', ''));
@@ -548,6 +711,7 @@ const api = {
       via: st.serial ? `KABEL (${st.serial})` : st.net ? `Wi-Fi (${st.net.ip})` : null,
       cutOff: !!cfg.cutOff,
       verify: cfg.verify !== false,
+      limitKBps: Number(cfg.limitKBps || 0),
       tokenSet: !!cfg.token,
       localDir: cfg.localDir,
     };
@@ -563,44 +727,123 @@ const api = {
   async save() { await save(); },
   setCutOff(v) { cfg.cutOff = !!v; return save(); },
   setVerify(v) { cfg.verify = !!v; return save(); },
+  setLimit(kbps) { cfg.limitKBps = Math.max(0, Number(kbps) || 0); return save(); },
   setToken(t) { cfg.token = String(t || '').trim(); debugTried = false; return save(); },
   async reconnect() { lastNet = 0; st.net = null; await tick(); return api.state; },
   fmt,
 };
 
 // ---------- main ----------
-async function main() {
-  if (+process.versions.node.split('.')[0] < 24) console.log('catatan: dirancang untuk Node 24+, versi kamu', process.version);
+async function loadCfg() {
   try { cfg = { ...cfg, ...JSON.parse(await fs.readFile(CFG, 'utf8')) }; } catch {}
   if (!cfg.localDir) cfg.localDir = path.join(os.homedir(), 'Downloads', 'transfer-file');
+  if (cfg.limitKBps == null) cfg.limitKBps = 0;
+}
+
+async function autostartOn() {
+  if (process.platform !== 'win32') return false;
+  try {
+    const { stdout } = await run('reg', ['query', 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run', '/v', 'KabelLink']);
+    return stdout.includes('KabelLink');
+  } catch { return false; }
+}
+
+/** Mode kontrol singkat: --stop / --status / --open / --background / --autostart. */
+async function controlMode(argv) {
+  if (argv.includes('--stop')) {
+    const pid = await stopDaemon();
+    console.log(pid ? `KabelLink latar belakang dihentikan (PID ${pid})` : 'tidak ada proses latar belakang');
+    return true;
+  }
+  if (argv.includes('--status')) {
+    const pid = await readPid();
+    console.log(pid ? `latar belakang JALAN (PID ${pid}) — Web UI http://127.0.0.1:8767`
+      : 'latar belakang tidak jalan');
+    console.log(`log: ${LOGF}`);
+    return true;
+  }
+  if (argv.includes('--open')) {
+    const r = await startDaemon();
+    if (!r.already) console.log(`latar belakang dijalankan (PID ${r.pid})`);
+    await sleep(800);
+    openUrl('http://127.0.0.1:8767');
+    console.log('Web UI: http://127.0.0.1:8767');
+    return true;
+  }
+  if (argv.includes('--background') || argv.includes('--bg')) {
+    const r = await startDaemon();
+    console.log(r.already ? `sudah jalan di latar belakang (PID ${r.pid})`
+      : `jalan di latar belakang (PID ${r.pid})`);
+    console.log(`Web UI: http://127.0.0.1:8767   log: ${LOGF}`);
+    return true;
+  }
+  const ai = argv.indexOf('--autostart');
+  if (ai >= 0) {
+    const on = argv[ai + 1] ? yes(argv[ai + 1]) : !(await autostartOn());
+    await autostart(on);
+    console.log(on ? 'autostart AKTIF — KabelLink ikut jalan saat Windows menyala' : 'autostart dimatikan');
+    return true;
+  }
+  return false;
+}
+
+async function main() {
+  if (+process.versions.node.split('.')[0] < 24) console.log('catatan: dirancang untuk Node 24+, versi kamu', process.version);
+  await loadCfg();
+  const argv = process.argv.slice(2);
+
+  if (await controlMode(argv)) return;
+
+  const daemon = argv.includes('--daemon');
 
   ROOT = await isElevated();
   log(ROOT ? 'hak akses: root/Administrator ✔' : 'PERINGATAN: bukan root/Administrator — perbaikan izin USB dimatikan');
   if (ROOT && process.platform === 'linux') await linuxFix(null).catch(e => log('udev gagal:', e.message));
 
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout, prompt: 'kabellink> ' });
-  let closed = false;
-  let chain = Promise.resolve();
-  const ended = new Promise(res => rl.on('close', () => { closed = true; res(); }));
-  rl.on('line', l => { chain = chain.then(() => exec(l, rl, () => closed)); });
-
-  if (!cfg.token) {
-    cfg.token = (await rl.question('Token dari layar APK di HP (Enter jika APK belum terpasang): ')).trim();
-    await save();
+  let rl = null, ended = Promise.resolve(), closed = () => true, chain = Promise.resolve();
+  if (daemon) {
+    await fs.mkdir(HOME, { recursive: true });
+    await fs.writeFile(PIDF, String(process.pid));
+    log(`mode latar belakang (PID ${process.pid}) — log: ${LOGF}`);
+    if (!cfg.token) log('token belum diisi — isi lewat Web UI (tombol Token) atau config.json');
+  } else {
+    rl = readline.createInterface({ input: process.stdin, output: process.stdout, prompt: 'kabellink> ' });
+    let isClosed = false;
+    ended = new Promise(res => rl.on('close', () => { isClosed = true; res(); }));
+    closed = () => isClosed;
+    rl.on('line', l => { chain = chain.then(() => exec(l, rl, closed)); });
+    if (!cfg.token) {
+      cfg.token = (await rl.question('Token dari layar APK di HP (Enter jika APK belum terpasang): ')).trim();
+      await save();
+    }
   }
-  ready = tick(); await ready;
-  setInterval(tick, 3000).unref();
-  console.log(HELP);
 
-  if (process.argv.slice(2).includes('--ui')) {
+  ready = tick(); await ready;
+  // Di mode latar belakang timer ini yang menjaga proses hidup; di mode terminal
+  // jangan menahan proses supaya `exit` benar-benar keluar.
+  const tickTimer = setInterval(tick, 3000);
+  if (!daemon) tickTimer.unref();
+
+  if (daemon) {
     const { startUi } = await import('./web.mjs');
-    await startUi(api);
-    setInterval(() => {}, 1 << 30); // tetap hidup selama Web UI dipakai
+    await startUi(api, { open: false });
+    const bye = async () => { await fs.rm(PIDF, { force: true }); process.exit(0); };
+    process.on('SIGINT', bye);
+    process.on('SIGTERM', bye);
+    await new Promise(() => {}); // jalan terus sampai dihentikan
     return;
   }
 
-  if (!closed) rl.prompt();
+  console.log(HELP);
 
+  if (argv.includes('--ui')) {
+    const { startUi } = await import('./web.mjs');
+    await startUi(api);
+    await ended;
+    return;
+  }
+
+  if (!closed()) rl.prompt();
   await ended;
   await chain;
   done();

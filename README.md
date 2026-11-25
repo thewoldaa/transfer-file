@@ -33,7 +33,10 @@ Ketik `ui` di terminal, atau jalankan `transfer-file.exe --ui`, maka browser ter
 - **Isi HP** — telusuri folder, lihat ukuran, tombol **Unduh** / **Unduh folder** / **Hapus**.
 - **Kirim ke HP** — taruh file di kotak (drag & drop) atau klik untuk pilih banyak file sekaligus.
 - **Antrean** — progress tiap transfer, status selesai/gagal, penanda `sha256 ok` dan `dihapus di HP`.
+  Transfer yang gagal punya tombol **Lanjutkan** dan melanjutkan dari byte terakhir.
 - **Cut-off** dan **Verifikasi SHA-256** — sakelar, tersimpan di config.
+- **Mode transmisi lambat** — pilih batas kecepatan (128 KB/detik … 4 MB/detik) supaya transfer
+  besar semalaman tidak membuat HP/PC panas.
 - **Sisa ruang HP** tampil di header.
 
 Semua file unduhan masuk ke `Downloads\transfer-file\` (bisa dibuka lewat tombol
@@ -52,10 +55,63 @@ Kalau salah satu gagal, file **tidak dihapus** dan diberi tanda gagal. Untuk fol
 folder kosong di HP ikut dirapikan setelah semua isinya pindah. Cut-off hanya berlaku
 untuk arah HP → PC; file yang kamu kirim ke HP tidak dihapus dari PC.
 
+## Jalan di latar belakang
+
+Supaya transfer besar bisa ditinggal tidur, jalankan tanpa jendela konsol:
+
+```
+transfer-file.exe --background      (atau: ketik bg di terminal)
+```
+
+Proses berjalan terpisah, Web UI tetap aktif di `http://127.0.0.1:8767`, dan jendela
+terminal boleh ditutup. Perintah pengelola:
+
+```
+--status        cek apakah latar belakang jalan (PID + lokasi log)
+--open          buka Web UI (otomatis menjalankan latar belakang bila belum)
+--stop          hentikan proses latar belakang
+--autostart on  ikut menyala otomatis saat Windows menyala
+--autostart off matikan autostart
+```
+
+Log ada di `%USERPROFILE%\.transfer-file\kabellink.log`, PID di `daemon.pid` (folder yang sama).
+Di HP, servis memegang **wake-lock** (CPU + Wi-Fi) selama aktif, jadi transfer tidak putus
+hanya karena layar mati. Tetap disarankan set baterai aplikasi ke *Unrestricted*.
+
+## Mode transmisi lambat
+
+Membatasi kecepatan supaya perangkat tidak panas saat transfer besar berjalan lama:
+
+```
+kabellink> limit 256      batasi 256 KB/detik
+kabellink> limit 1024     batasi 1 MB/detik
+kabellink> limit off      kembali tanpa batas
+```
+
+Di Web UI, pilih **Mode transmisi lambat → Batas kecepatan**. Batas ini berlaku untuk
+unduh **dan** kirim, serta tersimpan di config. Karena progress dicatat ke disk, transfer
+yang lambat pun tetap bisa dilanjutkan kapan saja.
+
+## Lanjut otomatis (resume)
+
+Koneksi putus di tengah jalan **tidak menghapus kemajuan**:
+
+- **HP → PC**: data ditulis ke `<nama>.part`. Unduhan berikutnya memakai HTTP `Range`
+  dan melanjutkan dari byte terakhir, lalu diganti nama setelah ukuran + SHA-256 cocok.
+- **PC → HP**: data ditulis ke `<nama>.part` **di HP** lewat `offset`, lalu diganti nama
+  (`/rename`) setelah selesai. Jalankan `put` yang sama lagi kapan pun untuk melanjutkan.
+
+Di Web UI, transfer yang gagal menampilkan tombol **Lanjutkan** (unduh) atau **Kirim ulang**
+(kirim). Tidak ada batas waktu — bisa dilanjutkan besok atau kapan saja selama file `.part`
+masih ada.
+
 ## Perintah transfer
 
 ```
 ui                         buka Web UI di browser
+bg | stop | open           latar belakang: mulai / hentikan / buka Web UI
+autostart [on|off]         jalankan otomatis saat Windows menyala
+limit <KB/detik|off>       mode transmisi lambat (mis. limit 256)
 ls [folder]                daftar isi HP (+ sisa ruang)
 get <jarak> [lokal]        ambil file ATAU folder dari HP
 put <lokal> [folder jarak] kirim file ATAU folder ke HP
@@ -76,8 +132,8 @@ kabellink> put "D:\album" Download
 ```
 
 Nama dengan spasi pakai tanda kutip. Transfer folder berjalan rekursif dan menampilkan progress.
-Unduhan memakai akhiran `.part` dan **bisa dilanjutkan** (HTTP Range) kalau Wi-Fi terputus —
-jalankan perintah yang sama lagi dan ia melanjutkan dari byte terakhir.
+Unduhan **dan** unggahan memakai akhiran `.part` dan bisa dilanjutkan kapan saja kalau
+koneksi terputus — jalankan perintah yang sama lagi dan ia melanjutkan dari byte terakhir.
 
 Perintah lain: `status`, `info`, `sh <perintah>`, `adb-on`, `adb <args>`, `wifi`, `token <kode>`, `exit`.
 
@@ -86,7 +142,9 @@ Perintah lain: `status`, `info`, `sh <perintah>`, `adb-on`, `adb <args>`, `wifi`
 - Folder akar transfer = `/sdcard` (seluruh penyimpanan) **jika** izin "Semua file" diberikan.
   Kalau belum, akar = folder milik aplikasi (`Android/data/app.kabellink/files`).
 - Server di HP: HTTP `8765` (wajib token) + UDP `8766` untuk penemuan. Jalan sebagai user biasa.
-- Tombol **Start**/**Stop** mengatur servis. Set baterai aplikasi ke *Unrestricted* agar tidak dimatikan sistem.
+- Selama servis aktif, APK memegang **wake-lock** CPU + Wi-Fi (`WAKE_LOCK`), jadi transfer
+  malam hari tetap jalan walau layar mati. Set baterai aplikasi ke *Unrestricted* agar
+  sistem tidak mematikannya.
 
 ## Kabel USB walau mode "Mengisi daya"
 
@@ -110,8 +168,8 @@ Push repo → tab **Actions** → workflow **build**:
 Buat tag untuk merilis keduanya sekaligus:
 
 ```
-git tag v1.2.0
-git push origin v1.2.0
+git tag v1.3.0
+git push origin v1.3.0
 ```
 
 Job **release** mengunggah `transfer-file.apk`, `transfer-file.exe`, dan `SHA256SUMS.txt` ke Releases.
